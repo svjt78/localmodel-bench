@@ -1,0 +1,16 @@
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+*.sqlite
+*.sqlite-journal
+*.log
+.DS_Store
+.env
+*.local
+coverage/
+
+# AI assistant config/instructions — kept local, never pushed
+CLAUDE.md
+AGENTS.md
+.claude/
