@@ -1,16 +1,16 @@
 import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
 import type {
-  AttachmentInfo,
   ClientCommand,
   ControllerEvent,
   ConversationMessage,
   ToolCallRecord,
 } from "@ollama-local/shared";
 import type { ConversationStore } from "./services/conversationStore.js";
-import { streamChat, generateTitle, type ChatMessageInput } from "./services/ollamaClient.js";
+import { streamChat, generateTitle } from "./services/ollamaClient.js";
+import { buildChatHistory } from "./services/chatHistory.js";
 import { fetchInstalledModels } from "./services/modelRegistry.js";
-import { buildNamedWorkspaceRoots, WorkspaceValidationError, type NamedRoot } from "./services/workspace.js";
+import { buildNamedWorkspaceRoots, type NamedRoot } from "./services/workspace.js";
 import {
   TOOL_DEFINITIONS,
   FETCH_URL_TOOL_DEFINITION,
@@ -20,37 +20,6 @@ import {
 } from "./services/toolLoop.js";
 import type { DiagnosticsLog } from "./services/diagnosticsLog.js";
 import type { PreferencesStore } from "./services/preferences.js";
-
-function attachmentContextBlock(attachment: AttachmentInfo): string {
-  if (attachment.kind === "text") {
-    return `--- ${attachment.fileName} ---\n${attachment.extractedText ?? ""}`;
-  }
-  if (attachment.kind === "image") {
-    return `--- ${attachment.fileName} ---\n(image attached — this model cannot see images)`;
-  }
-  return `--- ${attachment.fileName} ---\n(unsupported file type — not included)`;
-}
-
-function buildAttachmentContext(attachments: AttachmentInfo[]): string {
-  if (attachments.length === 0) return "";
-  return `[Attached files]\n${attachments.map(attachmentContextBlock).join("\n\n")}`;
-}
-
-// Gives attached documents the same explicit, system-level priority as the
-// workspace message below — without this, their extracted text is only
-// silently appended to the user's message, and the model tends to favor
-// tool exploration over noticing it's already been handed the content.
-function buildAttachmentSystemMessage(attachments: AttachmentInfo[]): string {
-  if (attachments.length === 0) return "";
-  const names = attachments.map((a) => `"${a.fileName}"`).join(", ");
-  const plural = attachments.length > 1 ? "s" : "";
-  return (
-    `You have ${attachments.length} attached document${plural}: ${names}. Their extracted text is included ` +
-    `at the end of the user's message below (under "[Attached files]") — you do not need any tool to read ` +
-    `them, they are not part of any workspace. Use their content directly when answering; don't overlook them ` +
-    `in favor of exploring workspace tools alone.`
-  );
-}
 
 // Without this, the model only ever sees the `tools` JSON schema with no
 // framing telling it a workspace even exists — vague phrasing like "refer to
@@ -165,6 +134,7 @@ export class WsSessionManager {
         this.activeTurns.get(command.conversationId)?.abortController.abort();
         return;
       case "switch_model":
+        if (this.activeTurns.has(command.conversationId)) return;
         this.store.setConversationModel(command.conversationId, command.model);
         return;
     }
@@ -182,22 +152,19 @@ export class WsSessionManager {
       return;
     }
 
-    const isFirstMessage = conversation.messages.length === 0;
-
-    const userMessage: ConversationMessage = {
-      id: randomUUID(),
-      role: "user",
-      text,
-      createdAt: Date.now(),
-    };
-    this.store.appendMessage(conversationId, userMessage);
-    this.send(ws, { type: "message", conversationId, message: userMessage });
-
-    const messageAttachments = this.store.getAttachmentsByIds(messageAttachmentIds);
-    for (const attachment of messageAttachments) {
-      this.store.linkAttachmentToMessage(attachment.id, userMessage.id);
+    if (this.activeTurns.has(conversationId)) {
+      this.send(ws, { type: "diagnostic", level: "warning", message: "A response is already running in this conversation." });
+      return;
     }
-
+    if (typeof text !== "string" || !text.trim() || !Array.isArray(messageAttachmentIds) ||
+        !messageAttachmentIds.every((id) => typeof id === "string")) {
+      this.send(ws, { type: "turn_state", conversationId, status: "failed", detail: "Invalid message or attachments." });
+      return;
+    }
+    const isFirstMessage = conversation.messages.length === 0;
+    const userMessage: ConversationMessage = {
+      id: randomUUID(), role: "user", text, createdAt: Date.now(),
+    };
     const abortController = new AbortController();
     this.activeTurns.set(conversationId, { abortController });
     this.send(ws, { type: "turn_state", conversationId, status: "running" });
@@ -210,7 +177,7 @@ export class WsSessionManager {
       const namedRoots: NamedRoot[] = conversation.workspaceSet
         ? buildNamedWorkspaceRoots(conversation.workspaceSet)
         : [];
-      const models = await fetchInstalledModels().catch(() => []);
+      const models = await fetchInstalledModels(abortController.signal).catch(() => []);
       const modelOption = models.find((m) => m.name === conversation.model);
       const workspaceToolsEnabled = namedRoots.length > 0 && Boolean(modelOption?.supportsTools);
       const fetchToolEnabled = conversation.internetEnabled && Boolean(modelOption?.supportsTools);
@@ -219,15 +186,12 @@ export class WsSessionManager {
         ...(fetchToolEnabled ? [FETCH_URL_TOOL_DEFINITION] : []),
       ];
 
-      const history: ChatMessageInput[] = [...conversation.messages, userMessage].map((m) => ({
-        role: m.role,
-        content: m.text,
-      }));
-
-      const allAttachments = [...conversation.attachments, ...messageAttachments];
-      if (allAttachments.length > 0) {
-        history.unshift({ role: "system", content: buildAttachmentSystemMessage(allAttachments) });
-      }
+      userMessage.attachments = this.store.getPendingAttachments(conversationId, messageAttachmentIds);
+      const history = await buildChatHistory(this.store, conversation, userMessage, modelOption);
+      abortController.signal.throwIfAborted();
+      // Validate images and capabilities before persisting a user turn or consuming draft files.
+      this.store.appendUserMessage(conversationId, userMessage, messageAttachmentIds);
+      this.send(ws, { type: "message", conversationId, message: userMessage });
 
       if (workspaceToolsEnabled) {
         history.unshift({ role: "system", content: buildWorkspaceSystemMessage(namedRoots) });
@@ -240,12 +204,6 @@ export class WsSessionManager {
       const systemPrompt = this.preferences.get().systemPrompt.trim();
       if (systemPrompt) {
         history.unshift({ role: "system", content: systemPrompt });
-      }
-
-      const attachmentContext = buildAttachmentContext(allAttachments);
-      if (attachmentContext && history.length > 0) {
-        const last = history[history.length - 1];
-        last.content = `${last.content}\n\n${attachmentContext}`;
       }
 
       let toolCallCount = 0;

@@ -12,5 +12,6 @@ coverage/
 
 # AI assistant config/instructions — kept local, never pushed
 CLAUDE.md
+Agent.md
 AGENTS.md
 .claude/

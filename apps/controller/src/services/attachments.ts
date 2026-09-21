@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { PDFParse } from "pdf-parse";
 import * as mammoth from "mammoth";
+import sharp from "sharp";
 import type { AttachmentInfo } from "@ollama-local/shared";
 
 export class AttachmentError extends Error {}
@@ -22,11 +23,46 @@ const IMAGE_MIME_BY_EXT: Record<string, string> = {
   ".webp": "image/webp",
   ".svg": "image/svg+xml",
   ".bmp": "image/bmp",
+  ".heic": "image/heic",
+  ".heif": "image/heif",
+  ".avif": "image/avif",
+  ".tif": "image/tiff",
+  ".tiff": "image/tiff",
 };
 
 const TEXT_CAP_BYTES = 1_000_000; // 1MB
 export const PDF_DOCX_SOURCE_CAP_BYTES = 20_000_000; // 20MB
 const IMAGE_CAP_BYTES = 10_000_000; // 10MB
+
+// Decode for validation, but send the original bytes without resizing or re-encoding.
+export async function validateImage(buffer: Buffer, fileName: string): Promise<"image/png" | "image/jpeg"> {
+  if (buffer.length > IMAGE_CAP_BYTES) throw new AttachmentError("Image exceeds the 10MB size limit");
+  const ext = path.extname(fileName).toLowerCase();
+  const expected = ext === ".png" ? "png" : [".jpg", ".jpeg"].includes(ext) ? "jpeg" : null;
+  if (!expected) throw new AttachmentError("Image format not supported. Attach a JPG or PNG image.");
+  try {
+    const image = sharp(buffer, { failOn: "warning", limitInputPixels: 40_000_000 });
+    const metadata = await image.metadata();
+    if (metadata.format !== expected || (metadata.pages ?? 1) > 1) throw new Error("format mismatch");
+    await image.stats(); // force a full decode; metadata alone accepts truncated files
+    return expected === "png" ? "image/png" : "image/jpeg";
+  } catch {
+    throw new AttachmentError("Image cannot be decoded. Use a valid JPG or PNG up to 40 megapixels, with a matching file extension.");
+  }
+}
+
+export async function readImageBase64(storedPath: string, fileName: string): Promise<string> {
+  try {
+    const stat = await fs.promises.stat(storedPath);
+    if (!stat.isFile() || stat.size > IMAGE_CAP_BYTES) throw new AttachmentError("Image exceeds the 10MB size limit or is not a file");
+    const buffer = await fs.promises.readFile(storedPath);
+    await validateImage(buffer, fileName);
+    return buffer.toString("base64");
+  } catch (err) {
+    if (err instanceof AttachmentError) throw err;
+    throw new AttachmentError("An attached image is missing or unreadable. Remove it and attach it again.");
+  }
+}
 
 export async function extractPdfText(buffer: Buffer): Promise<string> {
   const parser = new PDFParse({ data: buffer });
@@ -140,13 +176,12 @@ export async function ingestAttachment(
   }
 
   if (IMAGE_MIME_BY_EXT[ext]) {
-    if (stat.size > IMAGE_CAP_BYTES) {
-      throw new AttachmentError("Image exceeds the 10MB size limit");
-    }
+    if (stat.size > IMAGE_CAP_BYTES) throw new AttachmentError("Image exceeds the 10MB size limit");
+    const mimeType = await validateImage(await fs.promises.readFile(tempFilePath), originalFileName);
     fs.copyFileSync(tempFilePath, storedPath);
     return {
       fileName: originalFileName,
-      mimeType: IMAGE_MIME_BY_EXT[ext],
+      mimeType,
       sizeBytes: stat.size,
       kind: "image",
       storedPath,

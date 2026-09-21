@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS attachments (
   kind            TEXT NOT NULL CHECK (kind IN ('text','image','unsupported')),
   extracted_text  TEXT,
   stored_path     TEXT NOT NULL,
+  pending         INTEGER NOT NULL DEFAULT 0,
   created_at      INTEGER NOT NULL
 );
 `;
@@ -76,6 +77,7 @@ export interface AttachmentRow {
   kind: AttachmentInfo["kind"];
   extracted_text: string | null;
   stored_path: string;
+  pending: number;
   created_at: number;
 }
 
@@ -122,7 +124,7 @@ function rowToAttachment(row: AttachmentRow): AttachmentInfo {
     sizeBytes: row.size_bytes,
     kind: row.kind,
     extractedText: row.extracted_text ?? undefined,
-    scope: row.message_id ? "message" : "conversation",
+    scope: row.message_id || row.pending ? "message" : "conversation",
   };
 }
 
@@ -134,6 +136,10 @@ export class ConversationStore {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
+    const columns = this.db.prepare("PRAGMA table_info(attachments)").all() as { name: string }[];
+    if (!columns.some((column) => column.name === "pending")) {
+      this.db.exec("ALTER TABLE attachments ADD COLUMN pending INTEGER NOT NULL DEFAULT 0");
+    }
     // Additive migration for databases created before internet_enabled existed —
     // CREATE TABLE IF NOT EXISTS above is a no-op on an already-existing table.
     try {
@@ -211,14 +217,18 @@ export class ConversationStore {
       .prepare(`SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC`)
       .all(id) as MessageRow[];
     const attachmentRows = this.db
-      .prepare(`SELECT * FROM attachments WHERE conversation_id = ? AND message_id IS NULL ORDER BY created_at ASC`)
+      .prepare(`SELECT * FROM attachments WHERE conversation_id = ? ORDER BY created_at ASC`)
       .all(id) as AttachmentRow[];
 
     const summary = rowToSummary(row);
     return {
       ...summary,
-      attachments: attachmentRows.map(rowToAttachment),
-      messages: messageRows.map(rowToMessage),
+      attachments: attachmentRows.filter((a) => !a.message_id && !a.pending).map(rowToAttachment),
+      pendingMessageAttachments: attachmentRows.filter((a) => a.pending).map(rowToAttachment),
+      messages: messageRows.map((message) => ({
+        ...rowToMessage(message),
+        attachments: attachmentRows.filter((a) => a.message_id === message.id).map(rowToAttachment),
+      })),
       turnStatus: "idle",
     };
   }
@@ -255,13 +265,14 @@ export class ConversationStore {
     kind: AttachmentInfo["kind"];
     extractedText?: string;
     storedPath: string;
+    pending?: boolean;
   }): AttachmentInfo {
     const now = Date.now();
     this.db
       .prepare(
         `INSERT INTO attachments
-           (id, conversation_id, message_id, file_name, source_path, mime_type, size_bytes, kind, extracted_text, stored_path, created_at)
-         VALUES (@id, @conversationId, @messageId, @fileName, @sourcePath, @mimeType, @sizeBytes, @kind, @extractedText, @storedPath, @now)`,
+           (id, conversation_id, message_id, file_name, source_path, mime_type, size_bytes, kind, extracted_text, stored_path, created_at, pending)
+         VALUES (@id, @conversationId, @messageId, @fileName, @sourcePath, @mimeType, @sizeBytes, @kind, @extractedText, @storedPath, @now, @pending)`,
       )
       .run({
         id: input.id,
@@ -274,6 +285,7 @@ export class ConversationStore {
         kind: input.kind,
         extractedText: input.extractedText ?? null,
         storedPath: input.storedPath,
+        pending: input.pending ? 1 : 0,
         now,
       });
     return {
@@ -284,7 +296,7 @@ export class ConversationStore {
       sizeBytes: input.sizeBytes,
       kind: input.kind,
       extractedText: input.extractedText,
-      scope: input.messageId ? "message" : "conversation",
+      scope: input.messageId || input.pending ? "message" : "conversation",
     };
   }
 
@@ -293,17 +305,29 @@ export class ConversationStore {
     return row ?? null;
   }
 
-  linkAttachmentToMessage(attachmentId: string, messageId: string): void {
-    this.db.prepare(`UPDATE attachments SET message_id = ? WHERE id = ?`).run(messageId, attachmentId);
+  getPendingAttachments(conversationId: string, ids: string[]): AttachmentInfo[] {
+    return [...new Set(ids)].map((id) => {
+      const row = this.getAttachmentRow(id);
+      if (!row || row.conversation_id !== conversationId || !row.pending || row.message_id) {
+        throw new Error("A message attachment is no longer available in this conversation. Attach it again.");
+      }
+      return rowToAttachment(row);
+    });
   }
 
-  getAttachmentsByIds(ids: string[]): (AttachmentInfo & { storedPath: string })[] {
-    if (ids.length === 0) return [];
-    const placeholders = ids.map(() => "?").join(",");
-    const rows = this.db
-      .prepare(`SELECT * FROM attachments WHERE id IN (${placeholders})`)
-      .all(...ids) as AttachmentRow[];
-    return rows.map((row) => ({ ...rowToAttachment(row), storedPath: row.stored_path }));
+  appendUserMessage(conversationId: string, message: ConversationMessage, attachmentIds: string[]): void {
+    this.db.transaction(() => {
+      this.getPendingAttachments(conversationId, attachmentIds);
+      this.appendMessage(conversationId, message);
+      for (const id of new Set(attachmentIds)) {
+        this.db.prepare(`UPDATE attachments SET message_id = ?, pending = 0 WHERE id = ? AND conversation_id = ?`)
+          .run(message.id, id, conversationId);
+      }
+    })();
+  }
+
+  close(): void {
+    this.db.close();
   }
 
   // Deliberately does not touch the file at stored_path — removing an

@@ -7,6 +7,7 @@ export interface OllamaToolCall {
 export interface ChatMessageInput {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  images?: string[]; // raw base64, not data URLs; constructed only for model requests
   tool_calls?: OllamaToolCall[];
 }
 
@@ -55,6 +56,11 @@ export async function streamChat(opts: StreamChatOptions): Promise<StreamChatRes
   });
 
   if (!res.ok || !res.body) {
+    if (opts.messages.some((message) => message.images?.length)) {
+      // A runtime error may echo its request. Never copy image payloads into diagnostics.
+      await res.body?.cancel();
+      throw new Error(`Image request failed with status ${res.status}. Confirm that the local model/runtime supports JPG and PNG image inputs.`);
+    }
     const detail = await res.text().catch(() => "");
     throw new Error(`POST /api/chat failed with status ${res.status}: ${detail}`);
   }

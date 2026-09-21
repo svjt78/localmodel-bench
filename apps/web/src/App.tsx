@@ -73,7 +73,7 @@ interface AppState {
   toolActivity: ToolCallRecord[];
   conversationAttachments: AttachmentInfo[];
   pendingMessageAttachments: AttachmentInfo[];
-  stagedAttachmentFiles: { tempId: string; file: File }[];
+  stagedAttachmentFiles: { tempId: string; file: File; scope: "conversation" | "message" }[];
   controllerStatus: "connecting" | "connected" | "disconnected";
 }
 
@@ -95,7 +95,7 @@ type Action =
   | { kind: "add_pending_message_attachment"; attachment: AttachmentInfo }
   | { kind: "remove_pending_message_attachment"; id: string }
   | { kind: "clear_pending_message_attachments" }
-  | { kind: "add_staged_attachment_file"; tempId: string; file: File }
+  | { kind: "add_staged_attachment_file"; tempId: string; file: File; scope: "conversation" | "message" }
   | { kind: "remove_staged_attachment_file"; tempId: string }
   | { kind: "clear_staged_attachment_files" }
   | { kind: "set_preferences"; preferences: AppPreferences }
@@ -165,6 +165,8 @@ function reducer(state: AppState, action: Action): AppState {
         activeInternetEnabled: action.conversation.internetEnabled,
         toolActivity: lastAssistantToolCalls(action.conversation.messages),
         conversationAttachments: action.conversation.attachments,
+        pendingMessageAttachments: action.conversation.pendingMessageAttachments ?? [],
+        errorMessage: null,
         stagedAttachmentFiles: [],
       };
     case "start_new_conversation":
@@ -192,7 +194,7 @@ function reducer(state: AppState, action: Action): AppState {
     case "set_staged_internet_enabled":
       return { ...state, stagedInternetEnabled: action.enabled };
     case "start_turn":
-      return { ...state, toolActivity: [], errorMessage: null };
+      return { ...state, toolActivity: [], errorMessage: null, turnStatus: "running" };
     case "add_conversation_attachment":
       return { ...state, conversationAttachments: [...state.conversationAttachments, action.attachment] };
     case "remove_conversation_attachment":
@@ -212,7 +214,7 @@ function reducer(state: AppState, action: Action): AppState {
     case "add_staged_attachment_file":
       return {
         ...state,
-        stagedAttachmentFiles: [...state.stagedAttachmentFiles, { tempId: action.tempId, file: action.file }],
+        stagedAttachmentFiles: [...state.stagedAttachmentFiles, { tempId: action.tempId, file: action.file, scope: action.scope }],
       };
     case "remove_staged_attachment_file":
       return {
@@ -280,7 +282,12 @@ function applyEvent(state: AppState, event: ControllerEvent): AppState {
     case "message": {
       if (event.conversationId !== state.conversationId) return state;
       const withoutStreaming = state.messages.filter((m) => m.id !== event.message.id);
-      return { ...state, messages: [...withoutStreaming, event.message] };
+      return {
+        ...state, messages: [...withoutStreaming, event.message],
+        pendingMessageAttachments: event.message.role === "user"
+          ? state.pendingMessageAttachments.filter((a) => !event.message.attachments?.some((sent) => sent.id === a.id))
+          : state.pendingMessageAttachments,
+      };
     }
     case "message_delta": {
       if (event.conversationId !== state.conversationId) return state;
@@ -405,6 +412,19 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
   );
 }
 
+function ImagePreview({ attachment, file }: { attachment?: AttachmentInfo; file?: File }) {
+  const [localUrl, setLocalUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!file || !(file.type.startsWith("image/") || /\.(jpe?g|png)$/i.test(file.name))) return;
+    const url = URL.createObjectURL(file);
+    setLocalUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+  const src = attachment?.kind === "image" ? `/api/attachments/${attachment.id}/raw` : localUrl;
+  if (!src) return null;
+  return <a href={src} target="_blank" rel="noreferrer"><img className="attachment-preview" src={src} alt={attachment?.fileName ?? file?.name ?? "Attached image"} /></a>;
+}
+
 const RECOVERY_BASE_DELAY_MS = 1000;
 const RECOVERY_MAX_DELAY_MS = 8000;
 
@@ -414,6 +434,10 @@ export function App() {
   const conversationIdRef = useRef<string | null>(null);
   const recoveryInFlightRef = useRef(false);
   const [draft, setDraft] = useState("");
+  const sendingRef = useRef(false);
+  const uploadCountRef = useRef(0);
+  const [submitting, setSubmitting] = useState(false);
+  const [uploadCount, setUploadCount] = useState(0);
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [renamingConversationId, setRenamingConversationId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -563,42 +587,10 @@ export function App() {
     };
   }, []);
 
-  // Fires once a brand-new conversation is actually created (conversationId
-  // goes from null to a real id). Order matters here: any files staged
-  // client-side before the conversation existed must finish uploading
-  // (a real POST /api/attachments round trip + server-side extraction)
-  // BEFORE the first message is sent — otherwise send_message reaches the
-  // server, and the turn reads conversation.attachments from the DB, before
-  // the attachment's row has even been written, so the model's first reply
-  // silently misses it (it shows up fine from the second message onward).
+  // Creation must finish before uploading staged files; uploads must finish before inference.
   useEffect(() => {
-    if (!state.conversationId) return;
-    if (!state.pendingFirstMessage && state.stagedAttachmentFiles.length === 0) return;
-
-    let cancelled = false;
-    const conversationId = state.conversationId;
-    const staged = state.stagedAttachmentFiles;
-    const text = state.pendingFirstMessage;
-
-    async function finalizeFirstTurn() {
-      if (staged.length > 0) {
-        dispatch({ kind: "clear_staged_attachment_files" });
-        for (const { file } of staged) {
-          await handleAddConversationAttachment(file);
-        }
-      }
-      if (cancelled) return;
-      if (text) {
-        socketRef.current?.send({ type: "send_message", conversationId, text });
-        dispatch({ kind: "clear_pending_message" });
-      }
-    }
-
-    void finalizeFirstTurn();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (!state.conversationId || !state.pendingFirstMessage) return;
+    void sendWithAttachments(state.conversationId, state.pendingFirstMessage);
   }, [state.conversationId]);
 
   const selectedModelOption = useMemo(
@@ -608,73 +600,112 @@ export function App() {
 
   const isRunning = state.turnStatus === "running";
   const isConnected = state.controllerStatus === "connected";
-  const canSend =
-    Boolean(state.selectedModel) && state.ollamaState === "ready" && isConnected && draft.trim().length > 0;
+  const busy = isRunning || submitting || uploadCount > 0;
+  const relevantAttachments = [...state.conversationAttachments, ...state.pendingMessageAttachments,
+    ...state.messages.flatMap((m) => m.attachments ?? [])];
+  const hasImages = relevantAttachments.some((a) => a.kind === "image") || state.stagedAttachmentFiles.some(
+    ({ file }) => file.type.startsWith("image/") || /\.(jpe?g|png|gif|webp|svg|bmp|heic|avif)$/i.test(file.name));
+  const visionBlocked = hasImages && !selectedModelOption?.supportsVision;
+  const canSend = Boolean(state.selectedModel) && state.ollamaState === "ready" && isConnected &&
+    draft.trim().length > 0 && !busy && !visionBlocked;
+
+  async function sendWithAttachments(conversationId: string, text: string) {
+    try {
+      const ids = state.pendingMessageAttachments.map((a) => a.id);
+      for (const staged of state.stagedAttachmentFiles) {
+        const attachment = await uploadAttachment(staged.file, conversationId, staged.scope);
+        dispatch({ kind: staged.scope === "message" ? "add_pending_message_attachment" : "add_conversation_attachment", attachment });
+        if (staged.scope === "message") ids.push(attachment.id);
+        dispatch({ kind: "remove_staged_attachment_file", tempId: staged.tempId });
+      }
+      if (!socketRef.current?.send({ type: "send_message", conversationId, text, messageAttachmentIds: ids })) {
+        throw new Error("The app disconnected. Your attachments are saved; reconnect and send again.");
+      }
+      dispatch({ kind: "start_turn" });
+      setDraft("");
+    } catch (err) {
+      reportWorkspaceError(err instanceof Error ? err.message : "Unable to send attached files");
+    } finally {
+      dispatch({ kind: "clear_pending_message" });
+      sendingRef.current = false;
+      setSubmitting(false);
+    }
+  }
 
   function handleSend() {
+    if (!canSend || sendingRef.current || uploadCountRef.current > 0 || !state.selectedModel) return;
     const text = draft.trim();
-    if (!text || !state.selectedModel) return;
-    setDraft("");
-    dispatch({ kind: "start_turn" });
-
+    sendingRef.current = true;
+    setSubmitting(true);
     if (!state.conversationId) {
       const [primary, ...linked] = state.stagedWorkspaces;
-      const workspaceSet = primary ? { primary, linked } : null;
-      socketRef.current?.send({
-        type: "new_conversation",
-        model: state.selectedModel,
-        workspaceSet,
-        internetEnabled: state.stagedInternetEnabled,
-      });
+      const sent = socketRef.current?.send({ type: "new_conversation", model: state.selectedModel,
+        workspaceSet: primary ? { primary, linked } : null, internetEnabled: state.stagedInternetEnabled });
+      if (!sent) {
+        sendingRef.current = false;
+        setSubmitting(false);
+        reportWorkspaceError("The app disconnected. Reconnect and send again.");
+        return;
+      }
       dispatch({ kind: "queue_new_conversation", text });
     } else {
-      socketRef.current?.send({
-        type: "send_message",
-        conversationId: state.conversationId,
-        text,
-        messageAttachmentIds: state.pendingMessageAttachments.map((a) => a.id),
-      });
+      void sendWithAttachments(state.conversationId, text);
     }
-    dispatch({ kind: "clear_pending_message_attachments" });
   }
 
-  async function uploadAttachment(file: File): Promise<AttachmentInfo | null> {
-    if (!state.conversationId) return null;
+  async function uploadAttachment(file: File, conversationId: string, scope: "conversation" | "message"): Promise<AttachmentInfo> {
     const form = new FormData();
     form.append("file", file);
-    form.append("conversationId", state.conversationId);
+    form.append("conversationId", conversationId);
+    form.append("scope", scope);
     const res = await callApi("/api/attachments", { method: "POST", body: form });
     if (!res.ok) {
-      const err = (await res.json()) as { detail?: string };
-      dispatch({
-        kind: "controller_event",
-        event: { type: "diagnostic", level: "error", message: err.detail ?? "Attachment rejected" },
-      });
-      return null;
+      const err = await res.json().catch(() => ({})) as { detail?: string };
+      throw new Error(err.detail ?? "Attachment rejected");
     }
-    return (await res.json()) as AttachmentInfo;
+    return await res.json() as AttachmentInfo;
   }
 
-  async function handleAddConversationAttachment(file: File) {
-    const attachment = await uploadAttachment(file);
-    if (attachment) dispatch({ kind: "add_conversation_attachment", attachment });
+  async function addAttachment(file: File, scope: "conversation" | "message") {
+    if (busy || sendingRef.current || uploadCountRef.current) return;
+    if (!state.conversationId) {
+      dispatch({ kind: "add_staged_attachment_file", tempId: crypto.randomUUID(), file, scope });
+      return;
+    }
+    const conversationId = state.conversationId;
+    uploadCountRef.current += 1;
+    setUploadCount(uploadCountRef.current);
+    try {
+      const attachment = await uploadAttachment(file, conversationId, scope);
+      if (conversationIdRef.current === conversationId) {
+        dispatch({ kind: scope === "message" ? "add_pending_message_attachment" : "add_conversation_attachment", attachment });
+      }
+    } catch (err) {
+      reportWorkspaceError(err instanceof Error ? err.message : "Attachment upload failed");
+    } finally {
+      uploadCountRef.current -= 1;
+      setUploadCount(uploadCountRef.current);
+    }
   }
 
-  async function handleRemoveConversationAttachment(id: string) {
-    const res = await callApi(`/api/attachments/${id}`, { method: "DELETE" });
-    if (res.ok) {
+  async function removeAttachment(id: string) {
+    if (busy || uploadCountRef.current || sendingRef.current) return;
+    uploadCountRef.current += 1;
+    setUploadCount(uploadCountRef.current);
+    try {
+      const res = await callApi(`/api/attachments/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to remove attachment");
       dispatch({ kind: "remove_conversation_attachment", id });
-    } else {
-      dispatch({
-        kind: "controller_event",
-        event: { type: "diagnostic", level: "error", message: "Failed to remove attachment" },
-      });
+      dispatch({ kind: "remove_pending_message_attachment", id });
+      if (state.messages.some((m) => m.attachments?.some((a) => a.id === id)) && state.conversationId) {
+        await hydrateConversation(state.conversationId);
+      }
+    } catch (err) {
+      reportWorkspaceError(err instanceof Error ? err.message : "Failed to remove attachment");
+    } finally {
+      uploadCountRef.current -= 1;
+      setUploadCount(uploadCountRef.current);
     }
-  }
-
-  async function handleAddMessageAttachment(file: File) {
-    const attachment = await uploadAttachment(file);
-    if (attachment) dispatch({ kind: "add_pending_message_attachment", attachment });
   }
 
   function reportWorkspaceError(message: string) {
@@ -709,6 +740,7 @@ export function App() {
   }
 
   function handleModelChange(model: string) {
+    if (busy || sendingRef.current || uploadCountRef.current) return;
     dispatch({ kind: "select_model", model });
     if (state.conversationId) {
       socketRef.current?.send({ type: "switch_model", conversationId: state.conversationId, model });
@@ -716,10 +748,13 @@ export function App() {
   }
 
   function handleSelectConversation(id: string) {
+    if (busy || sendingRef.current || uploadCountRef.current) return;
+    setDraft("");
     if (id !== state.conversationId) void hydrateConversation(id);
   }
 
   async function handleDeleteConversation(id: string, title: string) {
+    if (busy) return;
     if (!window.confirm(`Permanently delete "${title}"? This cannot be undone.`)) return;
     const res = await callApi(`/api/conversations/${id}`, { method: "DELETE" });
     if (!res.ok) {
@@ -866,20 +901,14 @@ export function App() {
               hidden
               onChange={(e) => {
                 const file = e.target.files?.[0];
-                if (file) {
-                  if (state.conversationId) {
-                    void handleAddConversationAttachment(file);
-                  } else {
-                    dispatch({ kind: "add_staged_attachment_file", tempId: crypto.randomUUID(), file });
-                  }
-                }
+                if (file) void addAttachment(file, "conversation");
                 e.target.value = "";
               }}
             />
             <button
               type="button"
               className="icon-button"
-              disabled={!isConnected}
+              disabled={!isConnected || busy}
               title="Attach a file — to this conversation, or staged for the next one you start"
               onClick={() => conversationAttachInputRef.current?.click()}
             >
@@ -891,7 +920,7 @@ export function App() {
           )}
           {state.stagedAttachmentFiles.map((f) => (
             <div key={f.tempId} className="attachment-chip">
-              <span className="type-badge">pending</span>
+              <ImagePreview file={f.file} /><span className="type-badge">{f.scope === "message" ? "next message" : "pending"}</span>
               <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {f.file.name}
               </span>
@@ -899,6 +928,7 @@ export function App() {
               <button
                 type="button"
                 className="icon-button"
+                disabled={busy}
                 onClick={() => dispatch({ kind: "remove_staged_attachment_file", tempId: f.tempId })}
               >
                 ×
@@ -907,17 +937,17 @@ export function App() {
           ))}
           {state.conversationAttachments.map((a) => (
             <div key={a.id} className="attachment-chip">
-              <span className="type-badge">{a.kind}</span>
+              <ImagePreview attachment={a} /><span className="type-badge">{a.kind}</span>
               <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                 {a.fileName}
-                {a.kind === "image" && " — can't see images"}
+                {a.kind === "image" && !selectedModelOption?.supportsVision && " — select a vision model"}
                 {a.kind === "unsupported" && " — unsupported type"}
               </span>
               <span className="list-row__meta">{formatBytes(a.sizeBytes)}</span>
               <button
                 type="button"
                 className="icon-button"
-                onClick={() => void handleRemoveConversationAttachment(a.id)}
+                disabled={busy} onClick={() => void removeAttachment(a.id)}
               >
                 ×
               </button>
@@ -928,7 +958,7 @@ export function App() {
         <div className="rail-section rail-section--scrollable">
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <p className="rail-section__title">Conversations</p>
-            <button type="button" className="icon-button" onClick={() => dispatch({ kind: "start_new_conversation" })}>
+            <button type="button" className="icon-button" disabled={busy} onClick={() => { setDraft(""); dispatch({ kind: "start_new_conversation" }); }}>
               New
             </button>
           </div>
@@ -1026,18 +1056,18 @@ export function App() {
           <select
             value={state.selectedModel ?? ""}
             onChange={(e) => handleModelChange(e.target.value)}
-            disabled={state.models.length === 0}
+            aria-label="Model" disabled={state.models.length === 0 || busy}
           >
             {state.models.length === 0 && <option value="">No models installed</option>}
             {state.models.map((m) => (
               <option key={m.name} value={m.name}>
-                {m.alias ? `${m.alias} (${m.name})` : m.name}
+                {m.alias ? `${m.alias} (${m.name})` : m.name}{m.supportsVision ? " — Vision" : ""}
               </option>
             ))}
           </select>
           <StatusPill tone={isRunning ? "success" : "neutral"} label={isRunning ? "Working…" : "Idle"} pulse={isRunning} />
           <span className="tabular">{selectedModelOption?.supportsTools ? "tools: on" : "tools: off"}</span>
-          <span className="tabular">0 tok/s</span>
+          <span className="tabular">{selectedModelOption?.supportsVision ? "Vision supported" : selectedModelOption?.capabilitiesKnown ? "Text only" : "Vision capability unknown"}</span>
           <span className="tabular">budget: {state.toolActivity.length}/8</span>
           <span>{state.activeWorkspaceSet ? state.activeWorkspaceSet.primary.displayName : "No workspace"}</span>
           {state.activeInternetEnabled && <span className="tabular">Internet: on</span>}
@@ -1051,6 +1081,10 @@ export function App() {
             m.role === "user" ? (
               <div key={m.id} className="bubble bubble--user">
                 {m.text}
+                {m.attachments?.map((a) => <div className="attachment-chip" key={a.id}>
+                  <ImagePreview attachment={a} /><span>{a.fileName}</span>
+                  <button type="button" className="icon-button" disabled={busy} onClick={() => void removeAttachment(a.id)} aria-label={`Remove ${a.fileName}`}>×</button>
+                </div>)}
               </div>
             ) : (
               <div key={m.id} className="bubble bubble--assistant">
@@ -1072,12 +1106,12 @@ export function App() {
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
               {state.pendingMessageAttachments.map((a) => (
                 <span key={a.id} className="attachment-chip" style={{ borderBottom: "none", padding: "2px 8px", background: "var(--surface-raised)", borderRadius: 6 }}>
-                  <span className="type-badge">{a.kind}</span>
+                  <ImagePreview attachment={a} /><span className="type-badge">{a.kind}</span>
                   {a.fileName}
                   <button
                     type="button"
                     className="icon-button"
-                    onClick={() => dispatch({ kind: "remove_pending_message_attachment", id: a.id })}
+                    disabled={busy} onClick={() => void removeAttachment(a.id)}
                   >
                     ×
                   </button>
@@ -1092,15 +1126,15 @@ export function App() {
               hidden
               onChange={(e) => {
                 const file = e.target.files?.[0];
-                if (file) void handleAddMessageAttachment(file);
+                if (file) void addAttachment(file, "message");
                 e.target.value = "";
               }}
             />
             <button
               type="button"
               className="icon-button"
-              disabled={!state.conversationId || !isConnected}
-              title={state.conversationId ? "Attach a file to this message" : "Send a message first to attach files"}
+              disabled={!isConnected || busy}
+              title="Attach a file to this message"
               onClick={() => messageAttachInputRef.current?.click()}
             >
               +
@@ -1115,7 +1149,7 @@ export function App() {
                   if (canSend) handleSend();
                 }
               }}
-              disabled={state.ollamaState !== "ready" || !isConnected}
+              disabled={state.ollamaState !== "ready" || !isConnected || submitting}
             />
             {isRunning ? (
               <button type="button" className="btn" onClick={handleInterrupt}>
@@ -1127,6 +1161,11 @@ export function App() {
               </button>
             )}
           </div>
+          {visionBlocked && <p className="composer__hint" role="alert">
+            {selectedModelOption?.capabilitiesKnown ? "This model cannot read images." : "Vision capability could not be confirmed."}
+            {" Select a vision-capable model or remove the attached images before sending."}
+          </p>}
+          {(uploadCount > 0 || submitting) && <p className="composer__hint" role="status">Preparing attachments…</p>}
           <p className="composer__hint">
             Read-only — this model cannot modify files in this workspace.
             {state.activeInternetEnabled && " This model may fetch content from the internet."}
@@ -1194,7 +1233,7 @@ export function App() {
               <option value="">None</option>
               {state.models.map((m) => (
                 <option key={m.name} value={m.name}>
-                  {m.alias ? `${m.alias} (${m.name})` : m.name}
+                  {m.alias ? `${m.alias} (${m.name})` : m.name}{m.supportsVision ? " — Vision" : ""}
                 </option>
               ))}
             </select>

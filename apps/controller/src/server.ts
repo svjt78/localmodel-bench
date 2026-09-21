@@ -250,13 +250,17 @@ export function createApp(ctx: ServerContext) {
 
   app.post("/api/attachments", upload.single("file"), async (req, res) => {
     const file = req.file;
-    const { conversationId } = req.body as { conversationId?: unknown };
+    const { conversationId, scope } = req.body as { conversationId?: unknown; scope?: unknown };
     if (!file || typeof conversationId !== "string" || !conversationId) {
       if (file) fs.unlinkSync(file.path);
       res.status(400).json({ error: "invalid_request" });
       return;
     }
     try {
+      if (!ctx.store.getConversation(conversationId)) throw new AttachmentError("Conversation not found");
+      if (scope !== undefined && scope !== "conversation" && scope !== "message") {
+        throw new AttachmentError("Invalid attachment scope");
+      }
       const dataDir = ctx.preferences.get().dataDir;
       const ingested = await ingestAttachment(dataDir, file.path, file.originalname);
       const ext = path.extname(file.originalname).toLowerCase();
@@ -271,6 +275,7 @@ export function createApp(ctx: ServerContext) {
         id: randomUUID(),
         conversationId,
         messageId: null,
+        pending: scope === "message",
         fileName: ingested.fileName,
         sourcePath: file.originalname,
         mimeType: ingested.mimeType,

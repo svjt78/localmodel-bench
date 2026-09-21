@@ -34,6 +34,8 @@ export interface ModelOption {
   name: string; // Ollama tag, e.g. "qwen3:30b-a3b-instruct-2507-q4_K_M"
   alias: string | null; // "qfast" / "qthink" / "rson" if it matches a known alias
   supportsTools: boolean; // whether tool-calling is enabled for this model
+  supportsVision: boolean;
+  capabilitiesKnown: boolean; // false when model capability discovery failed
   sizeBytes: number;
   family: string; // "qwen3", "deepseek-r1", etc., from `ollama show`
 }
@@ -45,6 +47,7 @@ export interface ConversationMessage {
   role: MessageRole;
   text: string;
   toolCalls?: ToolCallRecord[]; // populated on assistant messages that read files
+  attachments?: AttachmentInfo[]; // message-scoped files, restored from storage
   createdAt: number;
   streaming?: boolean;
 }
@@ -64,6 +67,7 @@ export interface Conversation {
   workspaceSet: WorkspaceSet | null;
   internetEnabled: boolean; // fixed at creation, like workspaceSet — never mutated afterward
   attachments: AttachmentInfo[]; // conversation-scoped attachments
+  pendingMessageAttachments?: AttachmentInfo[]; // unsent draft files for this conversation only
   messages: ConversationMessage[];
   turnStatus: TurnStatus;
   createdAt: number;

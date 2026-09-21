@@ -68,9 +68,11 @@ export class ControllerSocket {
     return () => this.statusListeners.delete(listener);
   }
 
-  send(command: ClientCommand): void {
+  send(command: ClientCommand): boolean {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(command));
+      return true;
     }
+    return false;
   }
 }

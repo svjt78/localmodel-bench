@@ -17,9 +17,7 @@ interface OllamaTagsResponseModel {
   details?: {
     family?: string;
   };
-  // Ollama reports this directly per model (e.g. ["completion","tools"] vs
-  // ["completion","thinking"]) — authoritative, so we don't need to guess
-  // tool support from family/reputation the way build-spec §19 worried about.
+  // Some local runtimes include capabilities here; otherwise use /api/show.
   capabilities?: string[];
 }
 
@@ -35,12 +33,31 @@ export async function fetchInstalledModels(signal?: AbortSignal): Promise<ModelO
   const body = (await res.json()) as OllamaTagsResponse;
   const models = body.models ?? [];
 
-  return models.map((m): ModelOption => ({
-    name: m.name,
-    alias: KNOWN_ALIASES[m.name] ?? null,
-    supportsTools: (m.capabilities ?? []).includes("tools"),
-    sizeBytes: m.size ?? 0,
-    family: m.details?.family ?? "unknown",
+  return Promise.all(models.map(async (m): Promise<ModelOption> => {
+    let capabilities = m.capabilities;
+    if (!Array.isArray(capabilities)) {
+      try {
+        const show = await fetch(`${OLLAMA_BASE_URL}/api/show`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: m.name }),
+          signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000),
+        });
+        if (show.ok) {
+          const details = await show.json() as { capabilities?: string[] };
+          if (Array.isArray(details.capabilities)) capabilities = details.capabilities;
+        }
+      } catch { /* Unknown capabilities must never enable vision. */ }
+    }
+    return {
+      name: m.name,
+      alias: KNOWN_ALIASES[m.name] ?? null,
+      supportsTools: (capabilities ?? []).includes("tools"),
+      supportsVision: (capabilities ?? []).includes("vision"),
+      capabilitiesKnown: Array.isArray(capabilities),
+      sizeBytes: m.size ?? 0,
+      family: m.details?.family ?? "unknown",
+    };
   }));
 }
 
