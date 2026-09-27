@@ -15,3 +15,8 @@ CLAUDE.md
 Agent.md
 AGENTS.md
 .claude/
+
+# Local verification artifacts may include private conversation content
+.verification/
+*.sqlite-wal
+*.sqlite-shm

@@ -7,7 +7,9 @@ import type {
   ToolCallRecord,
 } from "@ollama-local/shared";
 import type { ConversationStore } from "./services/conversationStore.js";
-import { streamChat, generateTitle } from "./services/ollamaClient.js";
+import { streamChat, generateTitle, GenerationError } from "./services/ollamaClient.js";
+import { ATTACHMENT_TOOLS,retrieveAttachment } from "./services/attachmentRetrieval.js";
+import { ContextPolicy, loadProfile, assertMemory } from "./services/contextPolicy.js";
 import { buildChatHistory } from "./services/chatHistory.js";
 import { fetchInstalledModels } from "./services/modelRegistry.js";
 import { buildNamedWorkspaceRoots, type NamedRoot } from "./services/workspace.js";
@@ -77,6 +79,7 @@ interface TurnHandle {
 const MAX_LOOP_ITERATIONS = 20;
 
 export class WsSessionManager {
+  private readonly sockets = new Set<WebSocket>();
   private readonly activeTurns = new Map<string, TurnHandle>();
 
   constructor(
@@ -86,6 +89,8 @@ export class WsSessionManager {
   ) {}
 
   handleConnection(ws: WebSocket): void {
+    this.sockets.add(ws);
+    ws.on("close",()=>this.sockets.delete(ws));
     ws.on("message", (raw) => {
       let command: ClientCommand;
       try {
@@ -105,9 +110,8 @@ export class WsSessionManager {
   }
 
   private send(ws: WebSocket, event: ControllerEvent): void {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify(event));
-    }
+    const targets = 'conversationId' in event ? this.sockets : new Set([ws]);
+    for (const target of targets) if (target.readyState === target.OPEN) target.send(JSON.stringify(event));
   }
 
   private async handleCommand(ws: WebSocket, command: ClientCommand): Promise<void> {
@@ -130,6 +134,15 @@ export class WsSessionManager {
       case "send_message":
         await this.runTurn(ws, command.conversationId, command.text, command.messageAttachmentIds ?? []);
         return;
+      case "upgrade_conversation": {
+        if(this.activeTurns.has(command.conversationId)) throw new Error("Stop the response before upgrading.");
+        const c=this.store.getConversation(command.conversationId); if(!c)throw new Error("Conversation not found");
+        const prior=this.store.execution(c.id);
+        if(prior.version<1){this.store.saveRecord("upgrade:"+c.id,{prior,time:Date.now()});this.store.setExecution(c.id,{...prior,version:1});}
+        this.send(ws,{type:"conversation_loaded",conversation:this.store.getConversation(c.id)!});return;
+      }
+      case "retry_response":
+        await this.runTurn(ws,command.conversationId,"retry",[],true);return;
       case "interrupt_turn":
         this.activeTurns.get(command.conversationId)?.abortController.abort();
         return;
@@ -145,8 +158,9 @@ export class WsSessionManager {
     conversationId: string,
     text: string,
     messageAttachmentIds: string[],
+    retry = false,
   ): Promise<void> {
-    const conversation = this.store.getConversation(conversationId);
+    let conversation = this.store.getConversation(conversationId);
     if (!conversation) {
       this.send(ws, { type: "diagnostic", level: "error", message: "Conversation not found" });
       return;
@@ -161,18 +175,29 @@ export class WsSessionManager {
       this.send(ws, { type: "turn_state", conversationId, status: "failed", detail: "Invalid message or attachments." });
       return;
     }
-    const isFirstMessage = conversation.messages.length === 0;
-    const userMessage: ConversationMessage = {
+    const priorExecution=this.store.execution(conversationId);
+    const previousUser=retry ? [...conversation.messages].reverse().find(m=>m.role==='user') : undefined;
+    if(retry && !previousUser) throw new Error("No previous question to retry.");
+    if(previousUser){text=previousUser.text;conversation={...conversation,messages:conversation.messages.slice(0,conversation.messages.findIndex(m=>m.id===previousUser.id))};}
+    const isFirstMessage = conversation.messages.length === 0 && !retry;
+    const userMessage: ConversationMessage = previousUser ?? {
       id: randomUUID(), role: "user", text, createdAt: Date.now(),
     };
     const abortController = new AbortController();
     this.activeTurns.set(conversationId, { abortController });
     this.send(ws, { type: "turn_state", conversationId, status: "running" });
 
-    const assistantMessageId = randomUUID();
+    let assistantMessageId = randomUUID();
     let assistantText = "";
     const executedToolCalls: ToolCallRecord[] = [];
 
+    let contextNotice="";
+    const progress=(detail:string)=>{
+      if(detail.startsWith("Using "))contextNotice=detail;
+      this.store.setExecution(conversationId,{version:priorExecution.version,status:"running",detail,updatedAt:Date.now(),partial:assistantText?{id:assistantMessageId,role:"assistant",text:assistantText,createdAt:Date.now(),incomplete:true,streaming:true}:undefined});
+      this.send(ws,{type:"turn_state",conversationId,status:"running",detail});
+    };
+    progress("Preparing response…");
     try {
       const namedRoots: NamedRoot[] = conversation.workspaceSet
         ? buildNamedWorkspaceRoots(conversation.workspaceSet)
@@ -184,14 +209,19 @@ export class WsSessionManager {
       const tools = [
         ...(workspaceToolsEnabled ? TOOL_DEFINITIONS : []),
         ...(fetchToolEnabled ? [FETCH_URL_TOOL_DEFINITION] : []),
+        ...(priorExecution.version>=1 && modelOption?.supportsTools ? ATTACHMENT_TOOLS : []),
       ];
 
-      userMessage.attachments = this.store.getPendingAttachments(conversationId, messageAttachmentIds);
-      const history = await buildChatHistory(this.store, conversation, userMessage, modelOption);
+      if(!retry) userMessage.attachments = this.store.getPendingAttachments(conversationId, messageAttachmentIds);
+      // Check vision before model preparation, preserving pending attachments on rejection.
+      const initialHistory=await buildChatHistory(this.store,conversation,userMessage,modelOption);
+      if(!retry) {this.store.appendUserMessage(conversationId,userMessage,messageAttachmentIds);this.send(ws,{type:"message",conversationId,message:userMessage});}
+      const profile=priorExecution.version>=1 ? await loadProfile(this.store,conversation.model,abortController.signal) : undefined;
+      const policy=profile ? new ContextPolicy(this.store,conversation.model,profile,abortController.signal,progress,conversationId) : undefined;
+      const history = policy ? await buildChatHistory(this.store,conversation,userMessage,modelOption,(doc,label)=>policy.document(doc,label,text)) : initialHistory;
       abortController.signal.throwIfAborted();
       // Validate images and capabilities before persisting a user turn or consuming draft files.
-      this.store.appendUserMessage(conversationId, userMessage, messageAttachmentIds);
-      this.send(ws, { type: "message", conversationId, message: userMessage });
+
 
       if (workspaceToolsEnabled) {
         history.unshift({ role: "system", content: buildWorkspaceSystemMessage(namedRoots) });
@@ -207,26 +237,41 @@ export class WsSessionManager {
       }
 
       let toolCallCount = 0;
+      let answered=false;
 
       for (let iteration = 0; iteration < MAX_LOOP_ITERATIONS; iteration += 1) {
-        const result = await streamChat({
-          model: conversation.model,
-          messages: history,
-          tools: tools.length > 0 ? tools : undefined,
-          signal: abortController.signal,
-          onDelta: (delta) => {
-            assistantText += delta;
-            this.send(ws, {
-              type: "message_delta",
-              conversationId,
-              messageId: assistantMessageId,
-              delta,
+        let result: Awaited<ReturnType<typeof streamChat>> | undefined;
+        for(let attempt=0;attempt<(policy?2:1);attempt++) {
+          const output=attempt?16384:8192;
+          const prepared=policy?await policy.prepare(history,output,tools.length?tools:undefined):{messages:history,capacity:32768,estimated:0};
+          const attemptId=randomUUID();const started=Date.now();
+          const record=(status:string,extra:object={})=>this.store.saveRecord('attempt:'+attemptId,{conversationId,userMessageId:userMessage.id,retry,status,started,finished:Date.now(),capacity:prepared.capacity,output,...extra});
+          let lastPersist=0;
+          try {
+            if(policy)assertMemory();progress(attempt?'Recovering response with more answer space…':'Answering…');
+            result=await streamChat({model:conversation.model,messages:prepared.messages,tools:tools.length?tools:undefined,
+              signal:abortController.signal,options:{num_ctx:prepared.capacity,num_predict:output},
+              onThinking:()=>{if(Date.now()-lastPersist>1000){progress('Thinking…');lastPersist=Date.now();}},
+              onDelta:(delta)=>{assistantText+=delta;this.send(ws,{type:'message_delta',conversationId,messageId:assistantMessageId,delta});
+                if(Date.now()-lastPersist>500){progress('Answering…');lastPersist=Date.now();}}
             });
-          },
-        });
+            policy?.reconcile(prepared.messages,tools.length?tools:undefined,result.promptEvalCount);
+            record('completed',{usage:result});break;
+          } catch(error) {
+            record('incomplete',{reason:error instanceof GenerationError?error.reason:'request',partial:assistantText});
+            if(error instanceof GenerationError)policy?.reconcile(prepared.messages,tools.length?tools:undefined,error.result?.promptEvalCount);
+            if(policy && attempt===0 && error instanceof GenerationError && error.reason==='length'){
+              const partial:ConversationMessage={id:assistantMessageId,role:'assistant',text:assistantText,createdAt:Date.now(),incomplete:true,attemptId};
+              this.store.appendMessage(conversationId,partial);this.send(ws,{type:'message',conversationId,message:partial});
+              assistantMessageId=randomUUID();assistantText='';continue;
+            }
+            throw error;
+          }
+        }
+        if(!result)throw new Error('Response attempts exhausted. Partial work saved.');
 
         if (result.toolCalls.length === 0) {
-          break;
+          answered=true; break;
         }
 
         history.push({ role: "assistant", content: result.fullText, tool_calls: result.toolCalls });
@@ -248,7 +293,9 @@ export class WsSessionManager {
             call: { id, name: name as ToolCallRecord["name"], args, workspacePath: namedRoots[0]?.path ?? "" },
           });
 
-          const executed = await executeToolCall(namedRoots, id, name, args);
+          const attachmentTool=name==='read_attachment'||name==='search_attachments';
+          const attachmentResult=attachmentTool?retrieveAttachment(this.store,conversationId,name,args):'';
+          const executed = attachmentTool ? {record:{id,name:name as ToolCallRecord['name'],args,result:attachmentResult,workspacePath:''},resultText:attachmentResult,pathViolation:false} : await executeToolCall(namedRoots, id, name, args);
           executedToolCalls.push(executed.record);
           this.send(ws, { type: "tool_call_completed", conversationId, call: executed.record });
           history.push({ role: "tool", content: executed.resultText });
@@ -263,6 +310,8 @@ export class WsSessionManager {
         }
       }
 
+      if(!answered)throw new Error("Tool iteration allowance exhausted without a final answer. Partial work saved.");
+      if(!assistantText.trim()) throw new Error("Tool steps ended without a visible answer. Retry explicitly.");
       const assistantMessage: ConversationMessage = {
         id: assistantMessageId,
         role: "assistant",
@@ -272,7 +321,8 @@ export class WsSessionManager {
       };
       this.store.appendMessage(conversationId, assistantMessage);
       this.send(ws, { type: "message", conversationId, message: assistantMessage });
-      this.send(ws, { type: "turn_state", conversationId, status: "completed" });
+      this.store.setExecution(conversationId,{version:priorExecution.version,status:"completed",detail:contextNotice||undefined,updatedAt:Date.now()});
+      this.send(ws, { type: "turn_state", conversationId, status: "completed", detail:contextNotice||undefined });
 
       if (isFirstMessage && conversation.title === "New conversation") {
         void this.generateAndApplyTitle(ws, conversationId, text, assistantText, conversation.model);
@@ -285,6 +335,7 @@ export class WsSessionManager {
           id: assistantMessageId,
           role: "assistant",
           text: assistantText,
+          incomplete:true,
           toolCalls: executedToolCalls.length > 0 ? executedToolCalls : undefined,
           createdAt: Date.now(),
         };
@@ -300,6 +351,7 @@ export class WsSessionManager {
         });
       }
 
+      this.store.setExecution(conversationId,{version:priorExecution.version,status:aborted?"interrupted":"failed",updatedAt:Date.now(),detail:err instanceof Error?err.message:String(err)});
       this.send(ws, {
         type: "turn_state",
         conversationId,

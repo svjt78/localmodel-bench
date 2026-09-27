@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import path from "node:path";
 import type {
   AttachmentInfo,
+  ExecutionState,
   Conversation,
   ConversationMessage,
   ToolCallRecord,
@@ -9,6 +10,10 @@ import type {
 } from "@ollama-local/shared";
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS execution_state (conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runtime_records (key TEXT PRIMARY KEY, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS message_metadata (message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, body TEXT NOT NULL);
+
 CREATE TABLE IF NOT EXISTS conversations (
   id            TEXT PRIMARY KEY,
   title         TEXT NOT NULL,
@@ -136,6 +141,10 @@ export class ConversationStore {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
+    for (const row of this.db.prepare("SELECT conversation_id, body FROM execution_state").all() as {conversation_id:string;body:string}[]) {
+      const state = JSON.parse(row.body) as ExecutionState;
+      if (state.status === "running") this.setExecution(row.conversation_id,{...state,status:"interrupted",detail:"App restarted. Partial work is saved; retry explicitly."});
+    }
     const columns = this.db.prepare("PRAGMA table_info(attachments)").all() as { name: string }[];
     if (!columns.some((column) => column.name === "pending")) {
       this.db.exec("ALTER TABLE attachments ADD COLUMN pending INTEGER NOT NULL DEFAULT 0");
@@ -170,6 +179,7 @@ export class ConversationStore {
         internetEnabled: input.internetEnabled ? 1 : 0,
         now,
       });
+    this.setExecution(input.id, {version:1,status:"idle",updatedAt:now});
     return {
       id: input.id,
       title: input.title,
@@ -199,7 +209,10 @@ export class ConversationStore {
   // rows, never touches a file on disk, so attachment bytes under the data
   // dir survive even though their row is gone.
   deleteConversation(id: string): void {
-    this.db.prepare(`DELETE FROM conversations WHERE id = ?`).run(id);
+    this.db.transaction(()=>{
+      this.db.prepare("DELETE FROM runtime_records WHERE json_extract(body,'$.conversationId')=? OR key=?").run(id,"upgrade:"+id);
+      this.db.prepare(`DELETE FROM conversations WHERE id = ?`).run(id);
+    })();
   }
 
   listConversations(): ConversationSummary[] {
@@ -227,9 +240,11 @@ export class ConversationStore {
       pendingMessageAttachments: attachmentRows.filter((a) => a.pending).map(rowToAttachment),
       messages: messageRows.map((message) => ({
         ...rowToMessage(message),
+        ...this.messageMetadata(message.id),
         attachments: attachmentRows.filter((a) => a.message_id === message.id).map(rowToAttachment),
       })),
-      turnStatus: "idle",
+      turnStatus: this.execution(id).status,
+      execution: this.execution(id),
     };
   }
 
@@ -247,6 +262,7 @@ export class ConversationStore {
         toolCallsJson: message.toolCalls ? JSON.stringify(message.toolCalls) : null,
         createdAt: message.createdAt,
       });
+    this.db.prepare("INSERT OR REPLACE INTO message_metadata VALUES (?,?)").run(message.id,JSON.stringify({incomplete:message.incomplete,attemptId:message.attemptId}));
     this.touchConversation(conversationId);
   }
 
@@ -324,6 +340,25 @@ export class ConversationStore {
           .run(message.id, id, conversationId);
       }
     })();
+  }
+
+  private messageMetadata(id:string): Partial<ConversationMessage> {
+    const row=this.db.prepare("SELECT body FROM message_metadata WHERE message_id=?").get(id) as {body:string}|undefined;
+    return row?JSON.parse(row.body):{};
+  }
+  execution(id: string): ExecutionState {
+    const row = this.db.prepare("SELECT body FROM execution_state WHERE conversation_id=?").get(id) as {body:string}|undefined;
+    return row ? JSON.parse(row.body) : {version:0,status:"idle",updatedAt:0};
+  }
+  setExecution(id: string, state: ExecutionState): void {
+    this.db.prepare("INSERT OR REPLACE INTO execution_state VALUES (?,?)").run(id,JSON.stringify({...state,updatedAt:Date.now()}));
+  }
+  record(key: string): any {
+    const row = this.db.prepare("SELECT body FROM runtime_records WHERE key=?").get(key) as {body:string}|undefined;
+    return row ? JSON.parse(row.body) : undefined;
+  }
+  saveRecord(key:string,value:unknown): void {
+    this.db.prepare("INSERT OR REPLACE INTO runtime_records VALUES (?,?)").run(key,JSON.stringify(value));
   }
 
   close(): void {

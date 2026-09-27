@@ -64,6 +64,8 @@ interface AppState {
   conversations: ConversationListItem[];
   messages: ConversationMessage[];
   turnStatus: TurnStatus;
+  executionVersion: number;
+  progress: string;
   pendingFirstMessage: string | null;
   errorMessage: string | null;
   stagedWorkspaces: WorkspaceInfo[];
@@ -113,6 +115,7 @@ function initialState(): AppState {
     conversations: [],
     messages: [],
     turnStatus: "idle",
+    executionVersion: 1, progress: "",
     pendingFirstMessage: null,
     errorMessage: null,
     stagedWorkspaces: [],
@@ -158,7 +161,8 @@ function reducer(state: AppState, action: Action): AppState {
         ...state,
         conversationId: action.conversation.id,
         selectedModel: action.conversation.model,
-        messages: action.conversation.messages,
+        messages: [...action.conversation.messages,...(action.conversation.execution?.partial?[action.conversation.execution.partial]:[])],
+        executionVersion:action.conversation.execution?.version??0, progress:action.conversation.execution?.detail??"",
         turnStatus: action.conversation.turnStatus,
         pendingFirstMessage: null,
         activeWorkspaceSet: action.conversation.workspaceSet,
@@ -174,7 +178,7 @@ function reducer(state: AppState, action: Action): AppState {
         ...state,
         conversationId: null,
         messages: [],
-        turnStatus: "idle",
+        turnStatus: "idle", executionVersion:1, progress:"",
         errorMessage: null,
         pendingFirstMessage: null,
         activeWorkspaceSet: null,
@@ -256,7 +260,8 @@ function applyEvent(state: AppState, event: ControllerEvent): AppState {
       return {
         ...state,
         conversationId: event.conversation.id,
-        messages: event.conversation.messages,
+        messages: [...event.conversation.messages,...(event.conversation.execution?.partial?[event.conversation.execution.partial]:[])],
+        executionVersion:event.conversation.execution?.version??0, progress:event.conversation.execution?.detail??"",
         turnStatus: event.conversation.turnStatus,
         activeWorkspaceSet: event.conversation.workspaceSet,
         activeInternetEnabled: event.conversation.internetEnabled,
@@ -266,7 +271,8 @@ function applyEvent(state: AppState, event: ControllerEvent): AppState {
       if (event.conversation.id !== state.conversationId) return state;
       return {
         ...state,
-        messages: event.conversation.messages,
+        messages: [...event.conversation.messages,...(event.conversation.execution?.partial?[event.conversation.execution.partial]:[])],
+        executionVersion:event.conversation.execution?.version??0, progress:event.conversation.execution?.detail??"",
         turnStatus: event.conversation.turnStatus,
         activeWorkspaceSet: event.conversation.workspaceSet,
         activeInternetEnabled: event.conversation.internetEnabled,
@@ -277,7 +283,8 @@ function applyEvent(state: AppState, event: ControllerEvent): AppState {
       return {
         ...state,
         turnStatus: event.status,
-        errorMessage: event.status === "failed" ? (event.detail ?? "The turn failed.") : state.errorMessage,
+        progress: event.detail ?? "",
+        errorMessage: event.status === "failed" ? (event.detail ?? "The turn failed.") : null,
       };
     case "message": {
       if (event.conversationId !== state.conversationId) return state;
@@ -434,6 +441,8 @@ export function App() {
   const conversationIdRef = useRef<string | null>(null);
   const recoveryInFlightRef = useRef(false);
   const [draft, setDraft] = useState("");
+  const [composerExpanded, setComposerExpanded] = useState(false);
+  const messageInputRef = useRef<HTMLTextAreaElement | null>(null);
   const sendingRef = useRef(false);
   const uploadCountRef = useRef(0);
   const [submitting, setSubmitting] = useState(false);
@@ -623,6 +632,7 @@ export function App() {
       }
       dispatch({ kind: "start_turn" });
       setDraft("");
+      setComposerExpanded(false);
     } catch (err) {
       reportWorkspaceError(err instanceof Error ? err.message : "Unable to send attached files");
     } finally {
@@ -750,6 +760,7 @@ export function App() {
   function handleSelectConversation(id: string) {
     if (busy || sendingRef.current || uploadCountRef.current) return;
     setDraft("");
+    setComposerExpanded(false);
     if (id !== state.conversationId) void hydrateConversation(id);
   }
 
@@ -765,6 +776,7 @@ export function App() {
       return;
     }
     if (id === state.conversationId) {
+      setComposerExpanded(false);
       dispatch({ kind: "start_new_conversation" });
     }
     void refreshConversationList();
@@ -958,7 +970,7 @@ export function App() {
         <div className="rail-section rail-section--scrollable">
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <p className="rail-section__title">Conversations</p>
-            <button type="button" className="icon-button" disabled={busy} onClick={() => { setDraft(""); dispatch({ kind: "start_new_conversation" }); }}>
+            <button type="button" className="icon-button" disabled={busy} onClick={() => { setDraft(""); setComposerExpanded(false); dispatch({ kind: "start_new_conversation" }); }}>
               New
             </button>
           </div>
@@ -1065,7 +1077,7 @@ export function App() {
               </option>
             ))}
           </select>
-          <StatusPill tone={isRunning ? "success" : "neutral"} label={isRunning ? "Working…" : "Idle"} pulse={isRunning} />
+          <StatusPill tone={isRunning ? "success" : "neutral"} label={isRunning ? state.progress || "Working…" : "Idle"} pulse={isRunning} />
           <span className="tabular">{selectedModelOption?.supportsTools ? "tools: on" : "tools: off"}</span>
           <span className="tabular">{selectedModelOption?.supportsVision ? "Vision supported" : selectedModelOption?.capabilitiesKnown ? "Text only" : "Vision capability unknown"}</span>
           <span className="tabular">budget: {state.toolActivity.length}/8</span>
@@ -1073,6 +1085,11 @@ export function App() {
           {state.activeInternetEnabled && <span className="tabular">Internet: on</span>}
         </div>
 
+        {state.conversationId && <div className="context-controls" style={{padding:"8px 16px",display:"flex",gap:12,flexWrap:"wrap"}}>
+          {state.executionVersion<1 ? <button disabled={busy} onClick={()=>socketRef.current?.send({type:"upgrade_conversation",conversationId:state.conversationId!})}>Upgrade context handling</button> : <small>Automatic context management · originals preserved</small>}
+          {state.messages.some(m=>m.role==='user') && <button disabled={busy} onClick={()=>socketRef.current?.send({type:"retry_response",conversationId:state.conversationId!})}>Retry last response</button>}
+          {!isRunning && state.progress && <small role="status">{state.progress}</small>}
+        </div>}
         <div className="message-stream">
           {state.messages.length === 0 && (
             <p className="empty-hint">No messages yet. Pick a model and send one to get started.</p>
@@ -1088,6 +1105,7 @@ export function App() {
               </div>
             ) : (
               <div key={m.id} className="bubble bubble--assistant">
+                {m.incomplete && <small role="status">Incomplete response — preserved from an earlier attempt</small>}
                 {m.text ? (
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{m.text}</ReactMarkdown>
                 ) : m.streaming ? (
@@ -1101,7 +1119,7 @@ export function App() {
           {state.errorMessage && <div className="bubble bubble--assistant">Error: {state.errorMessage}</div>}
         </div>
 
-        <div className="composer">
+        <div className={`composer${composerExpanded ? " composer--expanded" : ""}`}>
           {state.pendingMessageAttachments.length > 0 && (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
               {state.pendingMessageAttachments.map((a) => (
@@ -1139,18 +1157,48 @@ export function App() {
             >
               +
             </button>
-            <textarea
-              placeholder="Send a message…"
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  if (canSend) handleSend();
-                }
-              }}
-              disabled={state.ollamaState !== "ready" || !isConnected || submitting}
-            />
+            <div className="composer__input">
+              <textarea
+                ref={messageInputRef}
+                id="message-input"
+                aria-label="Message"
+                aria-describedby="message-input-shortcuts"
+                placeholder="Send a message…"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                  if (e.key === "Enter" && !e.shiftKey && (!composerExpanded || e.metaKey)) {
+                    e.preventDefault();
+                    if (canSend) handleSend();
+                  }
+                }}
+                disabled={state.ollamaState !== "ready" || !isConnected || submitting}
+              />
+              <button
+                type="button"
+                className="icon-button icon-button--square composer__toggle"
+                title={composerExpanded ? "Collapse input" : "Expand input"}
+                aria-label={composerExpanded ? "Collapse input" : "Expand input"}
+                aria-expanded={composerExpanded}
+                aria-controls="message-input"
+                onClick={() => {
+                  const input = messageInputRef.current;
+                  const start = input?.selectionStart ?? 0;
+                  const end = input?.selectionEnd ?? 0;
+                  const direction = input?.selectionDirection ?? "none";
+                  setComposerExpanded((expanded) => !expanded);
+                  if (input && !input.disabled) {
+                    input.focus({ preventScroll: true });
+                    input.setSelectionRange(start, end, direction);
+                  }
+                }}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d={composerExpanded ? "M21 3l-7 7m0-6v6h6M3 21l7-7m-6 0h6v6" : "M14 10l7-7m-6 0h6v6M10 14l-7 7m0-6v6h6"} />
+                </svg>
+              </button>
+            </div>
             {isRunning ? (
               <button type="button" className="btn" onClick={handleInterrupt}>
                 Stop
@@ -1161,6 +1209,9 @@ export function App() {
               </button>
             )}
           </div>
+          <p id="message-input-shortcuts" className="composer__hint">
+            {composerExpanded ? "Enter for a new line · ⌘ Enter to send" : "Enter to send · Shift+Enter for a new line"}
+          </p>
           {visionBlocked && <p className="composer__hint" role="alert">
             {selectedModelOption?.capabilitiesKnown ? "This model cannot read images." : "Vision capability could not be confirmed."}
             {" Select a vision-capable model or remove the attached images before sending."}

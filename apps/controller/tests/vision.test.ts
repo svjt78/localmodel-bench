@@ -29,6 +29,7 @@ async function fixture(t: any) {
   const store = new ConversationStore(dir);
   t.after(async () => {store.close(); await fs.rm(dir,{recursive:true,force:true});});
   store.createConversation({id:'c',title:'Test',model:'vision',workspaceSet:null,internetEnabled:false});
+  store.setExecution('c',{version:0,status:'idle',updatedAt:0}); // Existing-conversation compatibility fixture.
   async function add(name='sample.png', buffer=png, pending=false, conversationId='c') {
     const source = path.join(dir,randomUUID()); await fs.writeFile(source,buffer);
     const ingested = await ingestAttachment(dir,source,name);

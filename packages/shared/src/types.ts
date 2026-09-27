@@ -50,11 +50,13 @@ export interface ConversationMessage {
   attachments?: AttachmentInfo[]; // message-scoped files, restored from storage
   createdAt: number;
   streaming?: boolean;
+  incomplete?: boolean;
+  attemptId?: string;
 }
 
 export interface ToolCallRecord {
   id: string;
-  name: "list_directory" | "read_file" | "search_files" | "fetch_url";
+  name: "list_directory" | "read_file" | "search_files" | "fetch_url" | "read_attachment" | "search_attachments";
   args: Record<string, unknown>;
   result: string; // truncated preview stored; full result not re-sent on reload
   workspacePath: string; // which workspace root this touched
@@ -70,9 +72,14 @@ export interface Conversation {
   pendingMessageAttachments?: AttachmentInfo[]; // unsent draft files for this conversation only
   messages: ConversationMessage[];
   turnStatus: TurnStatus;
+  execution?: ExecutionState;
   createdAt: number;
   updatedAt: number;
   archived: boolean;
+}
+
+export interface ExecutionState {
+  version: number; status: TurnStatus; detail?: string; partial?: ConversationMessage; updatedAt: number;
 }
 
 export interface PromptTemplate {
@@ -99,6 +106,8 @@ export type ControllerEvent =
 export type ClientCommand =
   | { type: "new_conversation"; model: string; workspaceSet: WorkspaceSet | null; internetEnabled?: boolean }
   | { type: "send_message"; conversationId: string; text: string; messageAttachmentIds?: string[] }
+  | { type: "upgrade_conversation"; conversationId: string }
+  | { type: "retry_response"; conversationId: string }
   | { type: "interrupt_turn"; conversationId: string }
   | { type: "switch_model"; conversationId: string; model: string };
 

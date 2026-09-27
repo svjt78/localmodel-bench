@@ -5,7 +5,7 @@ import path from "node:path";
 const APP_DATA_DIR_NAME = "Ollama Local Workspace";
 
 export function resolveDataDir(): string {
-  const dir = path.join(os.homedir(), "Library", "Application Support", APP_DATA_DIR_NAME);
+  const dir = process.env.OLLAMA_UI_DATA_DIR ? path.resolve(process.env.OLLAMA_UI_DATA_DIR) : path.join(os.homedir(), "Library", "Application Support", APP_DATA_DIR_NAME);
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(path.join(dir, "attachments"), { recursive: true });
   return dir;
